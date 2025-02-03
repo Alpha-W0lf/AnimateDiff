@@ -31,6 +31,9 @@ from ..models.unet import UNet3DConditionModel
 from ..models.sparse_controlnet import SparseControlNetModel
 import pdb
 
+from vidgen.utils.profiling import profiler
+from vidgen.utils.io_optimization import io_optimizer
+
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
 
@@ -239,20 +242,58 @@ class AnimationPipeline(DiffusionPipeline):
 
         return text_embeddings
 
-    def decode_latents(self, latents):
+    @profiler.profile_performance("animation_pipeline", "decode_latents")
+    async def decode_latents(self, latents):
+        """Decode latents with performance tracking"""
         video_length = latents.shape[2]
         latents = 1 / 0.18215 * latents
         latents = rearrange(latents, "b c f h w -> (b f) c h w")
-        # video = self.vae.decode(latents).sample
-        video = []
-        for frame_idx in tqdm(range(latents.shape[0])):
-            video.append(self.vae.decode(latents[frame_idx:frame_idx+1]).sample)
-        video = torch.cat(video)
+        
+        # Profile video decoding
+        with profiler.track_time("animation_pipeline", "vae_decode"):
+            with profiler.track_memory("animation_pipeline", "vae_decode"):
+                video = []
+                for frame_idx in tqdm(range(latents.shape[0])):
+                    video.append(self.vae.decode(latents[frame_idx:frame_idx+1]).sample)
+                video = torch.cat(video)
+        
         video = rearrange(video, "(b f) c h w -> b c f h w", f=video_length)
         video = (video / 2 + 0.5).clamp(0, 1)
-        # we always cast to float32 as this does not cause significant overhead and is compatible with bfloa16
         video = video.cpu().float().numpy()
         return video
+
+    @profiler.profile_performance("animation_pipeline", "prepare_latents")
+    def prepare_latents(self, batch_size, num_channels_latents, video_length, height, width, dtype, device, generator, latents=None):
+        """Prepare latents with performance tracking"""
+        shape = (batch_size, num_channels_latents, video_length, height // self.vae_scale_factor, width // self.vae_scale_factor)
+        
+        with profiler.track_memory("animation_pipeline", "latents_generation"):
+            if isinstance(generator, list) and len(generator) != batch_size:
+                raise ValueError(
+                    f"You have passed a list of generators of length {len(generator)}, but requested an effective batch"
+                    f" size of {batch_size}. Make sure the batch size matches the length of the generators."
+                )
+
+            if latents is None:
+                rand_device = "cpu" if device.type == "mps" else device
+
+                if isinstance(generator, list):
+                    shape = shape
+                    latents = [
+                        torch.randn(shape, generator=generator[i], device=rand_device, dtype=dtype)
+                        for i in range(batch_size)
+                    ]
+                    latents = torch.cat(latents, dim=0).to(device)
+                else:
+                    latents = torch.randn(shape, generator=generator, device=rand_device, dtype=dtype).to(device)
+            else:
+                if latents.shape != shape:
+                    raise ValueError(f"Unexpected latents shape, got {latents.shape}, expected {shape}")
+                latents = latents.to(device)
+
+        # Scale the initial noise by the standard deviation required by the scheduler
+        latents = latents * self.scheduler.init_noise_sigma
+        return latents
 
     def prepare_extra_step_kwargs(self, generator, eta):
         # prepare extra kwargs for the scheduler step, since not all schedulers have the same signature
@@ -285,6 +326,15 @@ class AnimationPipeline(DiffusionPipeline):
                 f"`callback_steps` has to be a positive integer but is {callback_steps} of type"
                 f" {type(callback_steps)}."
             )
+
+    @torch.no_grad()
+    @profiler.profile_performance("animation_pipeline", "generate")
+    async def __call__(self, prompt, *args, **kwargs):
+        """Main generation method with performance tracking"""
+        # Track overall generation time and memory
+        with profiler.track_time("animation_pipeline", "total_generation"):
+            with profiler.track_memory("animation_pipeline", "total_generation"):
+                return await super().__call__(prompt, *args, **kwargs)
 
     def prepare_latents(self, batch_size, num_channels_latents, video_length, height, width, dtype, device, generator, latents=None):
         shape = (batch_size, num_channels_latents, video_length, height // self.vae_scale_factor, width // self.vae_scale_factor)
